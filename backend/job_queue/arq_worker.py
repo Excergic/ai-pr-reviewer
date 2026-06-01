@@ -1,12 +1,58 @@
+# backend/job_queue/arq_worker.py
+#
+# ARQ async job queue — the bridge between webhook receipt and review execution.
+#
+# THE PROBLEM THIS SOLVES:
+# GitHub sends a webhook and expects a response within 10 seconds.
+# A full PR review (4 agents, LLM calls) takes 60-120 seconds.
+# If we ran the review synchronously inside the webhook handler, GitHub would
+# time out and retry, creating duplicate reviews.
+#
+# THE SOLUTION:
+# Webhook handler -> enqueues a job in Redis (< 100ms) -> returns 200 to GitHub
+# ARQ worker      -> picks up the job from Redis -> runs the full review
+#
+# HOW ARQ WORKS:
+# ARQ uses two Redis operations:
+#   PRODUCER side (webhook router): LPUSH arq:queue:default [job_payload_json]
+#   CONSUMER side (this worker):    BRPOP arq:queue:default [blocks until job appears]
+#
+# BRPOP is "blocking pop" — the worker sleeps at Redis waiting for a job.
+# When a job appears, Redis wakes the worker immediately (no polling loop).
+# This is the "push-based notification" pattern from Stream-Processing-Patterns.md
+# (as opposed to the anti-pattern of polling a database for new rows).
+#
+# WORKER FUNCTIONS:
+# An ARQ worker function is a coroutine that ARQ calls when a job is dequeued.
+# It receives a Context object (ARQ-provided) plus any arguments the producer sent.
+# It returns any value (ARQ logs it) or raises an exception (ARQ retries).
+#
+# RETRY BEHAVIOR:
+# By default, ARQ retries a failed job 5 times with exponential backoff.
+# Our job is idempotent (idempotency key in Redis prevents duplicate reviews)
+# so retries are safe.
+#
+# FROM Fault-Tolerance.md (distributed-systems wiki):
+# "Combine checkpointing with message logging."
+# ARQ + LangGraph checkpointing together mean:
+#   - ARQ: if the worker crashes, the job is requeued (message logging)
+#   - LangGraph: if the review was mid-graph, resume() continues from the checkpoint
+# Together: exactly-once review semantics despite worker crashes.
+
 import logging
 
+# Configure logging for the ARQ worker process.
+# main.py configures logging for the API process, but the worker is a separate
+# process that never imports main.py — so we configure it here directly.
+# Without this, all logger.info/error calls in this file are silently dropped.
 logging.basicConfig(
-    level = logging.INFO,
-    format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
 )
 
 from typing import Any
+
 from arq import ArqRedis, create_pool
 from arq.connections import RedisSettings
 
@@ -21,12 +67,23 @@ from backend.orchestrator.langgraph_engine import LangGraphEngine
 
 logger = logging.getLogger(__name__)
 
+# Module-level engine instance.
+# LangGraphEngine is stateless (no per-review state) — safe to share.
 _engine = LangGraphEngine()
+
+
+# =============================================================================
+# WORKER FUNCTION: run_pr_review
+#
+# This is the function ARQ calls when it dequeues a PR review job.
+# ARQ passes `ctx` (ARQ context dict) as the first argument automatically.
+# The remaining arguments match what enqueue_review_job() passes.
+# =============================================================================
 
 async def run_pr_review(
     ctx: dict[str, Any],
     workflow_id: str,
-    input_data: dict[str, Any]
+    input_data: dict[str, Any],
 ) -> dict[str, Any]:
     """
     ARQ worker function: runs a full PR review.
@@ -46,7 +103,6 @@ async def run_pr_review(
         Exception: if the review fails in a way that should trigger ARQ retry.
         (DuplicateWebhookError is NOT re-raised — it is a non-error skip case.)
     """
-
     job_id = ctx.get("job_id", "unknown")
     retry_count = ctx.get("retry", 0)
 
@@ -57,8 +113,9 @@ async def run_pr_review(
         retry_count,
     )
 
-
-    ## Idempotency Check
+    # -------------------------------------------------------------------------
+    # Step 1: Idempotency check
+    #
     # Before running the review, check if this exact review already ran.
     # This can happen if:
     #   - ARQ retried a job that already completed
@@ -70,12 +127,14 @@ async def run_pr_review(
     # already exists (it was set by enqueue_review_job). We do NOT re-check here
     # — that would cause every first-run to be skipped as a false duplicate.
 
+    # -------------------------------------------------------------------------
     # Step 2: Update workflow status to IN_PROGRESS in Redis cache
-
+    # -------------------------------------------------------------------------
     await redis_client.set_workflow_status(workflow_id, "in_progress")
 
-     # Step 3: Run the workflow
-
+    # -------------------------------------------------------------------------
+    # Step 3: Run the workflow
+    # -------------------------------------------------------------------------
     try:
         result = await _engine.run(workflow_id, input_data)
     except Exception as e:
@@ -90,15 +149,16 @@ async def run_pr_review(
         )
         await redis_client.set_workflow_status(workflow_id, "failed")
         return {
-             "workflow_id": workflow_id,
+            "workflow_id": workflow_id,
             "status": "failed",
             "verdict": None,
             "findings_count": 0,
             "error": str(e),
         }
 
-    #Step 4: Update final status in Redis cache
-
+    # -------------------------------------------------------------------------
+    # Step 4: Update final status in Redis cache
+    # -------------------------------------------------------------------------
     await redis_client.set_workflow_status(workflow_id, result.status.value)
 
     logger.info(
@@ -109,6 +169,7 @@ async def run_pr_review(
         len(result.findings),
     )
 
+    # -------------------------------------------------------------------------
     # Step 5: Trigger background repository ingestion (Phase 14)
     #
     # After a successful review, we kick off ingestion of the repo's codebase
@@ -125,10 +186,10 @@ async def run_pr_review(
     #
     # GRACEFUL: if enqueueing ingestion fails (Redis hiccup), we log and continue.
     # The review result has already been saved — nothing is lost.
-
+    # -------------------------------------------------------------------------
     if result.status.value == "completed":
-         repo_full_name = input_data.get("repo_full_name", "")  # flat key set by webhook router
-         if repo_full_name:
+        repo_full_name = input_data.get("repo_full_name", "")  # flat key set by webhook router
+        if repo_full_name:
             try:
                 # Build settings inline — WorkerSettings is defined later in this
                 # file, so we can't reference it here without a forward reference.
@@ -149,7 +210,7 @@ async def run_pr_review(
                     "ingestion_enqueue_failed | repo=%s error=%s: %s",
                     repo_full_name, type(e).__name__, e,
                 )
-    
+
     # Return a summary dict — ARQ logs this. Phase 10 will send this to traces.
     return {
         "workflow_id": workflow_id,
@@ -160,6 +221,8 @@ async def run_pr_review(
         "agents_failed": result.agents_failed,
     }
 
+
+# =============================================================================
 # PRODUCER HELPER: enqueue_review_job
 #
 # Called by the webhook router to enqueue a job.
