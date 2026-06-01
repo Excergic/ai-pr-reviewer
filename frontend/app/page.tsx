@@ -1,65 +1,141 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import useSWR from "swr";
+import Link from "next/link";
+import { ReviewStatusBadge } from "@/components/ReviewStatusBadge";
+import { VerdictChip } from "@/components/VerdictChip";
+import { Empty } from "@/components/Empty";
+import type { HITLItem, Paginated, ReviewSummary } from "@/lib/types";
+
+export default function DashboardPage() {
+  const { data: reviewsResp, error: reviewsErr } =
+    useSWR<Paginated<ReviewSummary>>("/api/v1/reviews?limit=50");
+  const { data: hitlResp, error: hitlErr } =
+    useSWR<Paginated<HITLItem>>("/api/v1/hitl/queue?limit=50");
+
+  const reviews = reviewsResp?.items ?? [];
+  const hitl = hitlResp?.items ?? [];
+  const recent = reviews.slice(0, 8);
+  const pendingHitl = hitl.filter((h) => h.status === "pending" || h.status === "in_review");
+  const escalated = reviews.filter((r) => r.status === "escalated" || r.needs_human_review).length;
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-2xl font-semibold">Dashboard</h1>
+        <p className="text-muted text-sm mt-1">
+          Live state of the review pipeline. Polls every 5s.
+        </p>
+      </div>
+
+      <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <Stat label="Reviews" value={reviewsResp?.total} err={!!reviewsErr} />
+        <Stat
+          label="HITL pending"
+          value={pendingHitl.length}
+          err={!!hitlErr}
+          tone={pendingHitl.length > 0 ? "warn" : "ok"}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+        <Stat label="Needs human review" value={escalated} err={!!reviewsErr} />
+      </section>
+
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-medium">Recent reviews</h2>
+          <Link href="/reviews" className="text-sm text-accent">
+            View all →
+          </Link>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+        {reviewsErr ? (
+          <Empty>Could not load reviews: {String(reviewsErr.message)}</Empty>
+        ) : recent.length === 0 ? (
+          <Empty>No reviews yet. Open a PR on a watched repo.</Empty>
+        ) : (
+          <div className="border border-border rounded-lg bg-panel divide-y divide-border">
+            {recent.map((r) => (
+              <Link
+                key={r.id}
+                href={`/reviews/${encodeURIComponent(r.id)}`}
+                className="flex items-center justify-between px-4 py-3 hover:bg-bg gap-3"
+              >
+                <div className="min-w-0">
+                  <div className="font-mono text-sm truncate">
+                    {r.repo_full_name} #{r.pr_number}
+                  </div>
+                  <div className="text-xs text-muted truncate mt-0.5">
+                    {r.pr_title}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <VerdictChip verdict={r.verdict} />
+                  <ReviewStatusBadge status={r.status} />
+                </div>
+              </Link>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-medium">HITL queue</h2>
+          <Link href="/hitl" className="text-sm text-accent">
+            Open queue →
+          </Link>
         </div>
-      </main>
+        {pendingHitl.length === 0 ? (
+          <Empty>Queue is clear.</Empty>
+        ) : (
+          <div className="border border-border rounded-lg bg-panel divide-y divide-border">
+            {pendingHitl.slice(0, 5).map((h) => (
+              <Link
+                key={h.id}
+                href={`/hitl/${encodeURIComponent(h.id)}`}
+                className="flex items-center justify-between px-4 py-3 hover:bg-bg gap-3"
+              >
+                <div className="min-w-0">
+                  <div className="font-mono text-sm truncate">
+                    {h.repo_full_name} #{h.pr_number}
+                  </div>
+                  <div className="text-xs text-muted truncate">
+                    {h.escalation_reason}
+                  </div>
+                </div>
+                <VerdictChip verdict={h.agent_verdict} />
+              </Link>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  err,
+  tone,
+}: {
+  label: string;
+  value?: number;
+  err?: boolean;
+  tone?: "ok" | "warn" | "err";
+}) {
+  const color =
+    tone === "warn"
+      ? "text-warn"
+      : tone === "err"
+      ? "text-err"
+      : tone === "ok"
+      ? "text-ok"
+      : "text-white";
+  return (
+    <div className="border border-border rounded-lg bg-panel px-4 py-3">
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      <div className={`text-2xl font-mono mt-1 ${color}`}>
+        {err ? "—" : value ?? "…"}
+      </div>
     </div>
   );
 }
