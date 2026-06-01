@@ -1,17 +1,41 @@
+# backend/models/webhook.py
+#
+# Pydantic models for GitHub webhook payloads.
+#
+# WHY A SEPARATE MODEL FOR WEBHOOKS?
+# GitHub sends a large JSON payload with many fields we do not need.
+# We parse only the fields we care about into typed models.
+# The rest is ignored.
+#
+# This also acts as a schema contract: if GitHub changes their payload format
+# and removes a field we depend on, Pydantic raises a validation error immediately
+# rather than a silent KeyError somewhere deep in our business logic.
+#
+# The GitHub webhook for a pull_request event looks like this (simplified):
+# {
+#   "action": "opened",
+#   "number": 42,
+#   "pull_request": {
+#     "title": "Add login feature",
+#     "head": { "sha": "abc123", "ref": "feature/login" },
+#     "base": { "ref": "main" },
+#     "diff_url": "https://github.com/.../42.diff",
+#     "user": { "login": "ayush488-glitch" }
+#   },
+#   "repository": {
+#     "full_name": "ayush488-glitch/my-project",
+#     "clone_url": "https://github.com/ayush488-glitch/my-project.git"
+#   }
+# }
+
 from pydantic import BaseModel
 
 from backend.models.enums import PullRequestAction
 
-class WebhookRepository(BaseModel):
-    """
-    The 'repository' object inside the webhook payload.
-    Represents the GitHub repository.
-    """
-    # Full name in format "owner/repo". e.g. "excergic/my-project"
-    full_name: str
 
-    # URL to clone the repo. Used in Phase 6 for RAG indexing.
-    clone_url: str
+# -----------------------------------------------------------------------------
+# Nested models - represent nested JSON objects in the payload
+# -----------------------------------------------------------------------------
 
 class WebhookPRHead(BaseModel):
     """
@@ -73,6 +97,22 @@ class WebhookPullRequest(BaseModel):
     user: WebhookPRUser
 
 
+class WebhookRepository(BaseModel):
+    """
+    The 'repository' object inside the webhook payload.
+    Represents the GitHub repository.
+    """
+    # Full name in format "owner/repo". e.g. "ayush488-glitch/my-project"
+    full_name: str
+
+    # URL to clone the repo. Used in Phase 6 for RAG indexing.
+    clone_url: str
+
+
+# -----------------------------------------------------------------------------
+# Top-level webhook event model
+# -----------------------------------------------------------------------------
+
 class WebhookEvent(BaseModel):
     """
     The complete parsed GitHub pull_request webhook payload.
@@ -99,11 +139,16 @@ class WebhookEvent(BaseModel):
     # The repository this PR belongs to
     repository: WebhookRepository
 
+    # -------------------------------------------------------------------------
+    # Computed properties
+    # These are not in the GitHub payload - we derive them for convenience
+    # so callers do not have to dig into nested objects every time.
+    # -------------------------------------------------------------------------
+
     @property
     def repo_full_name(self) -> str:
         """e.g. 'ayush488-glitch/my-project'"""
         return self.repository.full_name
-
 
     @property
     def pr_number(self) -> int:
